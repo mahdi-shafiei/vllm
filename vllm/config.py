@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ast
 import copy
@@ -24,52 +25,66 @@ import torch
 from pydantic import (ConfigDict, SkipValidation, TypeAdapter, field_validator,
                       model_validator)
 from pydantic.dataclasses import dataclass
+from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from torch.distributed import ProcessGroup, ReduceOp
-from transformers import PretrainedConfig
-from typing_extensions import deprecated, runtime_checkable
+from typing_extensions import Self, deprecated, runtime_checkable
 
 import vllm.envs as envs
 from vllm import version
 from vllm.compilation.inductor_pass import CallableInductorPass, InductorPass
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization import (QUANTIZATION_METHODS,
-                                                     QuantizationMethods,
-                                                     get_quantization_config)
-from vllm.model_executor.models import ModelRegistry
 from vllm.platforms import current_platform
-from vllm.tracing import is_otel_available, otel_import_error_traceback
 from vllm.transformers_utils.config import (
     ConfigFormat, get_config, get_hf_image_processor_config,
     get_hf_text_config, get_pooling_config,
     get_sentence_transformer_tokenizer_config, is_encoder_decoder,
-    try_get_generation_config, uses_mrope)
+    try_get_generation_config, try_get_safetensors_metadata,
+    try_get_tokenizer_config, uses_mrope)
 from vllm.transformers_utils.s3_utils import S3Model
 from vllm.transformers_utils.utils import is_s3, maybe_model_redirect
+# yapf conflicts with isort for this block
+# yapf: disable
 from vllm.utils import (DEFAULT_MAX_NUM_BATCHED_TOKENS,
                         MULTIMODAL_MODEL_MAX_NUM_BATCHED_TOKENS,
                         POOLING_MODEL_MAX_NUM_BATCHED_TOKENS, GiB_bytes,
-                        LayerBlockType, cuda_device_count_stateless,
-                        get_cpu_memory, get_open_port, is_torch_equal_or_newer,
-                        random_uuid, resolve_obj_by_qualname)
+                        LayerBlockType, LazyLoader, common_broadcastable_dtype,
+                        cuda_device_count_stateless, get_cpu_memory,
+                        get_open_port, is_torch_equal_or_newer, random_uuid,
+                        resolve_obj_by_qualname)
+
+# yapf: enable
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from ray.util.placement_group import PlacementGroup
+    from transformers.configuration_utils import PretrainedConfig
 
+    import vllm.model_executor.layers.quantization as me_quant
+    import vllm.model_executor.models as me_models
     from vllm.executor.executor_base import ExecutorBase
+    from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig)
     from vllm.model_executor.model_loader import BaseModelLoader
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 
     ConfigType = type[DataclassInstance]
+    HfOverrides = Union[dict, Callable[[type], type]]
 else:
     PlacementGroup = Any
+    PretrainedConfig = Any
     ExecutorBase = Any
     QuantizationConfig = Any
+    QuantizationMethods = Any
     BaseModelLoader = Any
     TensorizerConfig = Any
     ConfigType = type
+    HfOverrides = Union[dict[str, Any], Callable[[type], type]]
+
+    me_quant = LazyLoader("model_executor", globals(),
+                          "vllm.model_executor.layers.quantization")
+    me_models = LazyLoader("model_executor", globals(),
+                           "vllm.model_executor.models")
 
 logger = init_logger(__name__)
 
@@ -95,9 +110,6 @@ _TASK_RUNNER: dict[_ResolvedTask, RunnerType] = {
     for runner, tasks in _RUNNER_TASKS.items()
     for task in tasks
 }
-
-HfOverrides = Union[dict[str, Any], Callable[[PretrainedConfig],
-                                             PretrainedConfig]]
 
 
 @runtime_checkable
@@ -413,6 +425,8 @@ class ModelConfig:
     available.\n
     - "vllm" will use the vLLM model implementation.\n
     - "transformers" will use the Transformers model implementation."""
+    override_attention_dtype: Optional[str] = None
+    """Override dtype for attention"""
 
     def compute_hash(self) -> str:
         """
@@ -513,6 +527,12 @@ class ModelConfig:
 
         from vllm.platforms import current_platform
 
+        if (self.override_attention_dtype is not None
+                and not current_platform.is_rocm()):
+            warnings.warn(
+                "override-attention-dtype is set but not using ROCm platform",
+                stacklevel=2)
+
         if (self.enable_sleep_mode
                 and not current_platform.is_sleep_mode_available()):
             raise ValueError(
@@ -526,10 +546,10 @@ class ModelConfig:
                                self.code_revision, self.config_format)
 
         if hf_overrides_kw:
-            logger.info("Overriding HF config with %s", hf_overrides_kw)
+            logger.debug("Overriding HF config with %s", hf_overrides_kw)
             hf_config.update(hf_overrides_kw)
         if hf_overrides_fn:
-            logger.info("Overriding HF config with %s", hf_overrides_fn)
+            logger.debug("Overriding HF config with %s", hf_overrides_fn)
             hf_config = hf_overrides_fn(hf_config)
 
         self.hf_config = hf_config
@@ -540,7 +560,28 @@ class ModelConfig:
         self.encoder_config = self._get_encoder_config()
         self.hf_image_processor_config = get_hf_image_processor_config(
             self.model, hf_token=self.hf_token, revision=self.revision)
-        self.dtype = _get_and_verify_dtype(self.hf_config, self.dtype)
+
+        supported_tasks, task = self._resolve_task(self.task)
+        self.supported_tasks = supported_tasks
+        self.task = task
+        if self.task in ("draft", "generate"):
+            self.truncation_side = "left"
+        else:
+            self.truncation_side = "right"
+
+        model_info, arch = self.registry.inspect_model_cls(self.architectures)
+        self._model_info = model_info
+        self._architecture = arch
+
+        self.pooler_config = self._init_pooler_config()
+
+        self.dtype = _get_and_verify_dtype(
+            self.model,
+            self.hf_config,
+            self.dtype,
+            is_pooling_model=self.runner_type == "pooling",
+            revision=self.revision,
+        )
 
         # Workaround for Gemma 2 which uses interleaved sliding window
         # attention, but it's not specified in its config. TODO: remove this
@@ -597,16 +638,6 @@ class ModelConfig:
             raise ValueError(
                 "`override_neuron_config` is only supported on Neuron.")
 
-        supported_tasks, task = self._resolve_task(self.task)
-        self.supported_tasks = supported_tasks
-        self.task = task
-        if self.task in ("draft", "generate"):
-            self.truncation_side = "left"
-        else:
-            self.truncation_side = "right"
-
-        self.pooler_config = self._init_pooler_config()
-
         self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()
@@ -629,16 +660,26 @@ class ModelConfig:
 
     @property
     def registry(self):
-        return ModelRegistry
+        return me_models.ModelRegistry
 
     @property
     def architectures(self) -> list[str]:
+        # architectures in the model config.
         return getattr(self.hf_config, "architectures", [])
+
+    @property
+    def architecture(self) -> str:
+        # The architecture vllm actually used.
+        return self._architecture
+
+    @property
+    def model_info(self) -> dict[str, Any]:
+        return self._model_info
 
     def maybe_pull_model_tokenizer_for_s3(self, model: str,
                                           tokenizer: str) -> None:
         """Pull model/tokenizer from S3 to temporary directory when needed.
-        
+
         Args:
             model: Model name or path
             tokenizer: Tokenizer name or path
@@ -692,7 +733,6 @@ class ModelConfig:
             self.model, self.revision)
 
     def _init_pooler_config(self) -> Optional["PoolerConfig"]:
-
         if self.runner_type == "pooling":
             if isinstance(self.override_pooler_config, dict):
                 self.override_pooler_config = PoolerConfig(
@@ -841,14 +881,15 @@ class ModelConfig:
         return quant_cfg
 
     def _verify_quantization(self) -> None:
-        supported_quantization = QUANTIZATION_METHODS
+        supported_quantization = me_quant.QUANTIZATION_METHODS
         optimized_quantization_methods = [
             "fp8", "marlin", "modelopt", "gptq_marlin_24", "gptq_marlin",
             "awq_marlin", "fbgemm_fp8", "compressed-tensors", "experts_int8",
             "quark", "modelopt_fp4", "bitblas", "gptq_bitblas"
         ]
         if self.quantization is not None:
-            self.quantization = cast(QuantizationMethods, self.quantization)
+            self.quantization = cast(me_quant.QuantizationMethods,
+                                     self.quantization)
 
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
@@ -882,14 +923,14 @@ class ModelConfig:
 
             # Detect which checkpoint is it
             for name in quantization_methods:
-                method = get_quantization_config(name)
+                method = me_quant.get_quantization_config(name)
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization)
                 if quantization_override is not None:
                     # Raise error if the override is not custom (custom would
                     # be in QUANTIZATION_METHODS but not QuantizationMethods)
                     # and hasn't been added to the overrides list.
-                    if (name in get_args(QuantizationMethods)
+                    if (name in get_args(me_quant.QuantizationMethods)
                             and name not in overrides):
                         raise ValueError(
                             f"Quantization method {name} is an override but "
@@ -1361,9 +1402,9 @@ class ModelConfig:
     def is_encoder_decoder(self) -> bool:
         """Extract the HF encoder/decoder model flag."""
         """
-        For Mllama, VLLM overrides HF's is_encoder_decoder flag and sets it to 
+        For Mllama, VLLM overrides HF's is_encoder_decoder flag and sets it to
         True to enable cross-attention
-        Neuron needs all multimodal data to be in the decoder and does not 
+        Neuron needs all multimodal data to be in the decoder and does not
         need to explicitly enable cross-attention
         """
         if (current_platform.is_neuron()
@@ -1399,7 +1440,7 @@ class ModelConfig:
     @property
     def is_v1_compatible(self) -> bool:
         architectures = getattr(self.hf_config, "architectures", [])
-        return ModelRegistry.is_v1_compatible(architectures)
+        return me_models.ModelRegistry.is_v1_compatible(architectures)
 
     @property
     def is_matryoshka(self) -> bool:
@@ -1411,13 +1452,19 @@ class ModelConfig:
         return getattr(self.hf_config, "matryoshka_dimensions", None)
 
     def get_and_verify_max_len(self, max_model_len: int):
+        tokenizer_config = try_get_tokenizer_config(
+            self.tokenizer,
+            trust_remote_code=self.trust_remote_code,
+            revision=self.tokenizer_revision)
         max_model_len = _get_and_verify_max_len(
             hf_config=self.hf_text_config,
+            tokenizer_config=tokenizer_config,
             max_model_len=max_model_len,
             disable_sliding_window=self.disable_sliding_window,
             sliding_window_len=self.get_hf_config_sliding_window(),
             spec_target_max_model_len=self.spec_target_max_model_len,
             encoder_config=self.encoder_config)
+        logger.info("Using max model len %s", max_model_len)
         return max_model_len
 
 
@@ -1437,7 +1484,7 @@ class CacheConfig:
     sizes up to 32 are supported. On HPU devices, block size defaults to 128.
 
     This config has no static default. If left unspecified by the user, it will
-    be set in `Platform.check_and_update_configs()` based on the current
+    be set in `Platform.check_and_update_config()` based on the current
     platform."""
     gpu_memory_utilization: float = 0.9
     """The fraction of GPU memory to be used for the model executor, which can
@@ -1482,6 +1529,8 @@ class CacheConfig:
     """This enables dynamic calculation of `k_scale` and `v_scale` when
     kv_cache_dtype is fp8. If `False`, the scales will be loaded from the model
     checkpoint if available. Otherwise, the scales will default to 1.0."""
+    cpu_kvcache_space_bytes: Optional[int] = None
+    """(CPU backend only) CPU key-value cache space."""
 
     # Will be set after profiling.
     num_gpu_blocks: Optional[int] = field(default=None, init=False)
@@ -1511,7 +1560,6 @@ class CacheConfig:
     def __post_init__(self) -> None:
         self.swap_space_bytes = self.swap_space * GiB_bytes
 
-        self._verify_args()
         self._verify_cache_dtype()
         self._verify_prefix_caching()
 
@@ -1520,7 +1568,8 @@ class CacheConfig:
         # metrics info
         return {key: str(value) for key, value in self.__dict__.items()}
 
-    def _verify_args(self) -> None:
+    @model_validator(mode='after')
+    def _verify_args(self) -> Self:
         if self.cpu_offload_gb < 0:
             raise ValueError("CPU offload space must be non-negative"
                              f", but got {self.cpu_offload_gb}")
@@ -1529,6 +1578,8 @@ class CacheConfig:
             raise ValueError(
                 "GPU memory utilization must be less than 1.0. Got "
                 f"{self.gpu_memory_utilization}.")
+
+        return self
 
     def _verify_cache_dtype(self) -> None:
         if self.cache_dtype == "auto":
@@ -1734,8 +1785,29 @@ class ParallelConfig:
     """Port for data parallel messaging."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
+    data_parallel_backend: str = "mp"
+    """Backend to use for data parallel, either "mp" or "ray"."""
     enable_expert_parallel: bool = False
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
+    enable_eplb: bool = False
+    """Enable expert parallelism load balancing for MoE layers."""
+    num_redundant_experts: int = 0
+    """Number of redundant experts to use for expert parallelism."""
+    eplb_window_size: int = 1000
+    """Window size for expert load recording."""
+    eplb_step_interval: int = 3000
+    """
+    Interval for rearranging experts in expert parallelism.
+    
+    Note that if this is greater than the EPLB window size, only the metrics
+    of the last `eplb_window_size` steps will be used for rearranging experts.
+    """
+    eplb_log_balancedness: bool = False
+    """
+    Log the balancedness each step of expert parallelism.
+    This is turned off by default since it will cause communication overhead.
+    """
+
     max_parallel_loading_workers: Optional[int] = None
     """Maximum number of parallel loading workers when loading model
     sequentially in multiple batches. To avoid RAM OOM when using tensor
@@ -1768,7 +1840,7 @@ class ParallelConfig:
     """The full name of the worker class to use. If "auto", the worker class
     will be determined based on the platform."""
     sd_worker_cls: str = "auto"
-    """The full name of the worker class to use for speculative decofing.
+    """The full name of the worker class to use for speculative decoding.
     If "auto", the worker class will be determined based on the platform."""
     worker_extension_cls: str = ""
     """The full name of the worker extension class to use. The worker extension
@@ -1781,6 +1853,10 @@ class ParallelConfig:
 
     rank: int = 0
     """Global rank in distributed setup."""
+
+    enable_multimodal_encoder_data_parallel: bool = False
+    """ Use data parallelism instead of tensor parallelism for vision encoder.
+    Only support LLama4 for now"""
 
     @property
     def world_size_across_dp(self) -> int:
@@ -1802,18 +1878,41 @@ class ParallelConfig:
         return answer
 
     def stateless_init_dp_group(self) -> "ProcessGroup":
+        # NOTE: In high-concurrency scenarios multiple processes
+        # can pick the same (currently free) port through a race
+        # condition when calling `get_open_port()`. When the first
+        # process binds the port the others will subsequently fail
+        # with `torch.distributed.DistNetworkError: EADDRINUSE`.
+        # To make the initialization more robust we retry a few times
+        # with a fresh port whenever this specific error is observed.
+        from torch.distributed import DistNetworkError
+
         from vllm.distributed.utils import (
             stateless_init_torch_distributed_process_group)
 
-        # use gloo since the engine process might not have cuda device
-        dp_group = stateless_init_torch_distributed_process_group(
-            self.data_parallel_master_ip,
-            self.get_next_dp_init_port(),
-            self.data_parallel_rank,
-            self.data_parallel_size,
-            backend="gloo")
+        max_retries = 5
+        last_exc: Optional[Exception] = None
+        for _ in range(max_retries):
+            try:
+                # use gloo since the engine process might not have cuda device
+                return stateless_init_torch_distributed_process_group(
+                    self.data_parallel_master_ip,
+                    self.get_next_dp_init_port(),
+                    self.data_parallel_rank,
+                    self.data_parallel_size,
+                    backend="gloo")
+            except DistNetworkError as e:
+                # We only want to retry when the root cause is EADDRINUSE.
+                if "EADDRINUSE" in str(e):
+                    logger.warning(
+                        "Address already in use. Retrying with a new port.")
+                    last_exc = e
+                    continue  # try again with a new port
+                raise e
 
-        return dp_group
+        # If we get here all retries have failed.
+        assert last_exc is not None
+        raise last_exc
 
     @staticmethod
     def has_unfinished_dp(dp_group: "ProcessGroup",
@@ -1841,6 +1940,8 @@ class ParallelConfig:
         factors.append(self.pipeline_parallel_size)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_expert_parallel)
+        factors.append(self.data_parallel_size)
+        factors.append(envs.VLLM_ALL2ALL_BACKEND)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
     def __post_init__(self) -> None:
@@ -1868,17 +1969,20 @@ class ParallelConfig:
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
             logger.info("Disabling V1 multiprocessing for external launcher.")
 
-        ray_only_devices: list[str] = []
-        from vllm.platforms import current_platform
-        if (current_platform.device_type in ray_only_devices
-                and self.world_size > 1):
-            if self.distributed_executor_backend is None:
-                self.distributed_executor_backend = "ray"
-            if self.distributed_executor_backend != "ray":
+        if self.enable_eplb:
+            if not current_platform.is_cuda():
                 raise ValueError(
-                    f"{current_platform.device_type.upper()} backend only "
-                    "supports Ray for distributed inference.")
-
+                    "Expert parallelism load balancing is only supported on "
+                    "CUDA devices now.")
+            if self.num_redundant_experts < 0:
+                raise ValueError(
+                    "num_redundant_experts must be non-negative, but got "
+                    f"{self.num_redundant_experts}.")
+        else:
+            if self.num_redundant_experts != 0:
+                raise ValueError(
+                    "num_redundant_experts should be used with EPLB."
+                    f"{self.num_redundant_experts}.")
         if self.distributed_executor_backend is None and self.world_size > 1:
             # We use multiprocessing by default if world_size fits on the
             # current node and we aren't in a ray placement group.
@@ -1889,6 +1993,8 @@ class ParallelConfig:
             if current_platform.is_neuron():
                 # neuron uses single process to control multiple devices
                 backend = "uni"
+            elif current_platform.is_tpu() and envs.VLLM_XLA_USE_SPMD:
+                backend = "uni"
             elif (current_platform.is_cuda()
                   and cuda_device_count_stateless() < self.world_size):
                 if not ray_found:
@@ -1896,6 +2002,10 @@ class ParallelConfig:
                                      "required for multi-node inference, "
                                      "please install Ray with `pip install "
                                      "ray`.") from ray_utils.ray_import_err
+                backend = "ray"
+            elif self.data_parallel_backend == "ray":
+                logger.info("Using ray distributed inference because "
+                            "data_parallel_backend is ray")
                 backend = "ray"
             elif ray_found:
                 if self.placement_group:
@@ -1907,13 +2017,11 @@ class ParallelConfig:
                         if get_current_placement_group():
                             backend = "ray"
             self.distributed_executor_backend = backend
-            logger.info("Defaulting to use %s for distributed inference",
-                        backend)
+            logger.debug("Defaulting to use %s for distributed inference",
+                         backend)
 
         if self.distributed_executor_backend is None and self.world_size == 1:
             self.distributed_executor_backend = "uni"
-
-        self._verify_args()
 
     @property
     def use_ray(self) -> bool:
@@ -1921,7 +2029,8 @@ class ParallelConfig:
             isinstance(self.distributed_executor_backend, type)
             and self.distributed_executor_backend.uses_ray)
 
-    def _verify_args(self) -> None:
+    @model_validator(mode='after')
+    def _verify_args(self) -> Self:
         # Lazy import to avoid circular import
         from vllm.executor.executor_base import ExecutorBase
         from vllm.platforms import current_platform
@@ -1941,15 +2050,14 @@ class ParallelConfig:
 
         if not current_platform.use_custom_allreduce():
             self.disable_custom_all_reduce = True
-            logger.info(
+            logger.debug(
                 "Disabled the custom all-reduce kernel because it is not "
                 "supported on current platform.")
         if self.ray_workers_use_nsight and not self.use_ray:
             raise ValueError("Unable to use nsight profiling unless workers "
                              "run with Ray.")
 
-        assert isinstance(self.worker_extension_cls, str), (
-            "worker_extension_cls must be a string (qualified class name).")
+        return self
 
 
 PreemptionMode = Literal["swap", "recompute"]
@@ -2081,6 +2189,12 @@ class SchedulerConfig:
     default scheduler. Can be a class directly or the path to a class of form
     "mod.custom_class"."""
 
+    disable_hybrid_kv_cache_manager: bool = False
+    """If set to True, KV cache manager will allocate the same size of KV cache
+    for all attention layers even if there are multiple type of attention layers
+    like full attention and sliding window attention.
+    """
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -2167,9 +2281,8 @@ class SchedulerConfig:
                 self.max_num_partial_prefills, self.max_long_partial_prefills,
                 self.long_prefill_token_threshold)
 
-        self._verify_args()
-
-    def _verify_args(self) -> None:
+    @model_validator(mode='after')
+    def _verify_args(self) -> Self:
         if (self.max_num_batched_tokens < self.max_model_len
                 and not self.chunked_prefill_enabled):
             raise ValueError(
@@ -2228,6 +2341,8 @@ class SchedulerConfig:
                 "must be greater than or equal to 1 and less than or equal to "
                 f"max_num_partial_prefills ({self.max_num_partial_prefills}).")
 
+        return self
+
     @property
     def is_multi_step(self) -> bool:
         return self.num_scheduler_steps > 1
@@ -2241,11 +2356,11 @@ Device = Literal["auto", "cuda", "neuron", "cpu", "tpu", "xpu", "hpu"]
 class DeviceConfig:
     """Configuration for the device to use for vLLM execution."""
 
-    device: SkipValidation[Union[Device, torch.device]] = "auto"
+    device: SkipValidation[Optional[Union[Device, torch.device]]] = "auto"
     """Device type for vLLM execution.
-    This parameter is deprecated and will be 
-    removed in a future release. 
-    It will now be set automatically based 
+    This parameter is deprecated and will be
+    removed in a future release.
+    It will now be set automatically based
     on the current platform."""
     device_type: str = field(init=False)
     """Device type from the current platform. This is set in
@@ -2283,7 +2398,10 @@ class DeviceConfig:
                     "to turn on verbose logging to help debug the issue.")
         else:
             # Device type is assigned explicitly
-            self.device_type = self.device
+            if isinstance(self.device, str):
+                self.device_type = self.device
+            elif isinstance(self.device, torch.device):
+                self.device_type = self.device.type
 
         # Some device types require processing inputs on CPU
         if self.device_type in ["neuron"]:
@@ -2337,7 +2455,7 @@ class SpeculativeConfig:
     according to the log probability settings in SamplingParams."""
 
     # Draft model configuration
-    quantization: Optional[QuantizationMethods] = None
+    quantization: Optional[me_quant.QuantizationMethods] = None
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
     takes effect when using the draft model-based speculative method."""
@@ -2583,7 +2701,8 @@ class SpeculativeConfig:
                     else:
                         eagle_config = EAGLEConfig(
                             self.draft_model_config.hf_config,
-                            method=self.method)
+                            method=self.method,
+                            model_type="eagle")
                         self.draft_model_config.hf_config = eagle_config
 
                 if (self.num_speculative_tokens is not None
@@ -2629,8 +2748,6 @@ class SpeculativeConfig:
                 self.posterior_threshold = 0.09
             if self.posterior_alpha is None:
                 self.posterior_alpha = 0.3
-
-        self._verify_args()
 
     @staticmethod
     def _maybe_override_draft_max_model_len(
@@ -2722,7 +2839,8 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
-    def _verify_args(self) -> None:
+    @model_validator(mode='after')
+    def _verify_args(self) -> Self:
         if self.num_speculative_tokens is None:
             raise ValueError(
                 "num_speculative_tokens must be provided with "
@@ -2772,6 +2890,8 @@ class SpeculativeConfig:
             raise ValueError(
                 "Eagle3 is only supported for Llama models. "
                 f"Got {self.target_model_config.hf_text_config.model_type=}")
+
+        return self
 
     @property
     def num_lookahead_slots(self) -> int:
@@ -3074,13 +3194,37 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
     "bfloat16": torch.bfloat16,
 }
 
-_ROCM_NOT_SUPPORTED_DTYPE: list[str] = []  #
+# model_type -> reason
+_FLOAT16_NOT_SUPPORTED_MODELS = {
+    "gemma2": "Numerical instability. Please use bfloat16 or float32 instead.",
+    "gemma3": "Numerical instability. Please use bfloat16 or float32 instead.",
+    "plamo2": "Numerical instability. Please use bfloat16 or float32 instead.",
+    "glm4": "Numerical instability. Please use bfloat16 or float32 instead.",
+}
 
 
-def _get_and_verify_dtype(
+def _is_valid_dtype(model_type: str, dtype: torch.dtype):
+    if model_type in _FLOAT16_NOT_SUPPORTED_MODELS and dtype == torch.float16:  # noqa: E501, SIM103
+        return False
+
+    return True
+
+
+def _check_valid_dtype(model_type: str, dtype: torch.dtype):
+    if model_type in _FLOAT16_NOT_SUPPORTED_MODELS and dtype == torch.float16:
+        reason = _FLOAT16_NOT_SUPPORTED_MODELS[model_type]
+        raise ValueError(f"The model type {model_type!r} "
+                         f"does not support float16. Reason: {reason}")
+
+    return True
+
+
+def _find_dtype(
+    model_id: str,
     config: PretrainedConfig,
-    dtype: Union[str, torch.dtype],
-) -> torch.dtype:
+    *,
+    revision: Optional[str],
+):
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
     config_dtype = getattr(config, "torch_dtype", None)
@@ -3091,76 +3235,114 @@ def _get_and_verify_dtype(
         config_dtype = getattr(config.get_text_config(), "torch_dtype", None)
     if config_dtype is None and hasattr(config, "vision_config"):
         config_dtype = getattr(config.vision_config, "torch_dtype", None)
+    if config_dtype is None and hasattr(config, "encoder_config"):
+        config_dtype = getattr(config.encoder_config, "torch_dtype", None)
+
+    # Try to read the dtype of the weights if they are in safetensors format
+    if config_dtype is None:
+        repo_mt = try_get_safetensors_metadata(model_id, revision=revision)
+
+        if repo_mt and (files_mt := repo_mt.files_metadata):
+            param_dtypes: set[torch.dtype] = {
+                _SAFETENSORS_TO_TORCH_DTYPE[dtype_str]
+                for file_mt in files_mt.values()
+                for dtype_str in file_mt.parameter_count
+                if dtype_str in _SAFETENSORS_TO_TORCH_DTYPE
+            }
+
+            if param_dtypes:
+                return common_broadcastable_dtype(param_dtypes)
 
     if config_dtype is None:
         config_dtype = torch.float32
+
+    return config_dtype
+
+
+def _resolve_auto_dtype(
+    model_type: str,
+    config_dtype: torch.dtype,
+    *,
+    is_pooling_model: bool,
+):
+    from vllm.platforms import current_platform
+
+    supported_dtypes = [
+        dtype for dtype in current_platform.supported_dtypes
+        if _is_valid_dtype(model_type, dtype)
+    ]
+
+    if is_pooling_model and torch.float16 in supported_dtypes:
+        preferred_dtype = torch.float16
+    else:
+        preferred_dtype = supported_dtypes[0]
+
+    # Downcast for float32 models
+    if config_dtype == torch.float32:
+        config_dtype = preferred_dtype
+
+    if config_dtype in supported_dtypes:
+        return config_dtype
+
+    # Ensure device compatibility
+    device_name = current_platform.get_device_name()
+    device_capability = current_platform.get_device_capability()
+
+    if device_capability is None:
+        device_str = f"{device_name!r}"
+    else:
+        version_str = device_capability.as_version_str()
+        device_str = f"{device_name!r} (with compute capability {version_str})"
+
+    logger.warning(
+        "Your device %s doesn't support %s. "
+        "Falling back to %s for compatibility.",
+        device_str,
+        config_dtype,
+        preferred_dtype,
+    )
+
+    return preferred_dtype
+
+
+def _get_and_verify_dtype(
+    model_id: str,
+    config: PretrainedConfig,
+    dtype: Union[str, torch.dtype],
+    *,
+    is_pooling_model: bool,
+    revision: Optional[str] = None,
+) -> torch.dtype:
+    config_dtype = _find_dtype(model_id, config, revision=revision)
+    model_type = config.model_type
 
     if isinstance(dtype, str):
         dtype = dtype.lower()
         if dtype == "auto":
             # Set default dtype from model config
-            if config_dtype == torch.float32:
-                # Following common practice, we use float16 for float32 models
-                torch_dtype = torch.float16
-            else:
-                torch_dtype = config_dtype
-
-            if config.model_type == "plamo2":
-                logger.warning(
-                    "For PLaMo2, we cast models to bfloat16 instead of using "
-                    "float16 by default. This is because float16 does not work."
-                )
-                torch_dtype = torch.bfloat16
-
-            # Deal with torch dtype fallback for device compatibility.
-            from vllm.platforms import current_platform
-            if torch_dtype not in current_platform.supported_dtypes:
-                device_name = current_platform.get_device_name()
-
-                if ((capability := current_platform.get_device_capability())
-                        is None):
-                    compute_str = ""
-                else:
-                    version_str = capability.as_version_str()
-                    compute_str = f" (with compute capability {version_str})"
-                fallback_dtype = current_platform.supported_dtypes[0]
-                logger.warning(
-                    "Your %s device%s doesn't support %s. " \
-                    "Falling back to %s for compatibility.",
-                    device_name, compute_str, torch_dtype, fallback_dtype
-                    )
-                torch_dtype = fallback_dtype
-
-            if current_platform.is_hpu() and torch_dtype == torch.float16:
-                logger.warning(
-                    "For HPU, we cast models to bfloat16 instead of "
-                    "using float16 by default. Please specify `dtype` if you "
-                    "want to use float16.")
-                torch_dtype = torch.bfloat16
-        elif dtype == "float16" and config.model_type == "plamo2":
-            logger.warning(
-                "For PLaMo2, using float16 is unstable and might cause "
-                "unexpected behavior. Please use bfloat16 or float32 instead.")
-            torch_dtype = torch.float16
+            torch_dtype = _resolve_auto_dtype(
+                model_type,
+                config_dtype,
+                is_pooling_model=is_pooling_model,
+            )
         else:
             if dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
-                raise ValueError(f"Unknown dtype: {dtype}")
+                raise ValueError(f"Unknown dtype: {dtype!r}")
             torch_dtype = _STR_DTYPE_TO_TORCH_DTYPE[dtype]
     elif isinstance(dtype, torch.dtype):
         torch_dtype = dtype
     else:
         raise ValueError(f"Unknown dtype: {dtype}")
 
-    # Verify the dtype.
+    _check_valid_dtype(model_type, torch_dtype)
+
     if torch_dtype != config_dtype:
         if torch_dtype == torch.float32:
             # Upcasting to float32 is allowed.
             logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
-            pass
         elif config_dtype == torch.float32:
             # Downcasting from float32 to float16 or bfloat16 is allowed.
             logger.info("Downcasting %s to %s.", config_dtype, torch_dtype)
-            pass
         else:
             # Casting between float16 and bfloat16 is allowed with a warning.
             logger.warning("Casting %s to %s.", config_dtype, torch_dtype)
@@ -3170,6 +3352,7 @@ def _get_and_verify_dtype(
 
 def _get_and_verify_max_len(
     hf_config: PretrainedConfig,
+    tokenizer_config: Optional[dict],
     max_model_len: Optional[int],
     disable_sliding_window: bool,
     sliding_window_len: Optional[Union[int, list[Optional[int]]]],
@@ -3196,7 +3379,7 @@ def _get_and_verify_max_len(
         "max_seq_length",
         "seq_len",
     ]
-    # Choose the smallest "max_length" from the possible keys.
+    # Choose the smallest "max_length" from the possible keys
     max_len_key = None
     for key in possible_keys:
         max_len = getattr(hf_config, key, None)
@@ -3218,6 +3401,13 @@ def _get_and_verify_max_len(
             if sliding_window_len_min < derived_max_model_len else max_len_key
         derived_max_model_len = min(derived_max_model_len,
                                     sliding_window_len_min)
+
+    # Consider model_max_length in tokenizer_config
+    if tokenizer_config:
+        tokenizer_model_max_length = tokenizer_config.get(
+            "model_max_length", derived_max_model_len)
+        derived_max_model_len = min(derived_max_model_len,
+                                    tokenizer_model_max_length)
 
     # If none of the keys were found in the config, use a default and
     # log a warning.
@@ -3513,6 +3703,7 @@ class ObservabilityConfig:
                 and "," in self.collect_detailed_traces[0]):
             self._parse_collect_detailed_traces()
 
+        from vllm.tracing import is_otel_available, otel_import_error_traceback
         if not is_otel_available() and self.otlp_traces_endpoint is not None:
             raise ValueError(
                 "OpenTelemetry is not available. Unable to configure "
@@ -3691,15 +3882,18 @@ class PassConfig:
     its own stages (before, after, maybe in-between)."""
     dump_graph_dir: Path = Path(".")
     """Directory to dump the graphs."""
-    # TODO(luka) better pass enabling system.
-    enable_fusion: bool = True
-    """Whether to enable the custom fusion pass."""
-    enable_noop: bool = True
+    enable_fusion: bool = field(default_factory=lambda: not envs.VLLM_USE_V1)
+    """Whether to enable the custom fusion (RMSNorm/SiluMul+quant) pass."""
+    enable_attn_fusion: bool = False
+    """Whether to enable the custom attention+quant fusion pass."""
+    enable_noop: bool = field(default_factory=lambda: not envs.VLLM_USE_V1)
     """Whether to enable the custom no-op elimination pass."""
     enable_sequence_parallelism: bool = False
     """Whether to enable sequence parallelism."""
     enable_async_tp: bool = False
     """Whether to enable async TP."""
+
+    # TODO(luka) better pass enabling system.
 
     def uuid(self):
         """
@@ -3708,18 +3902,20 @@ class PassConfig:
         Do not include dump_graph_* in the hash - they don't affect
         compilation.
         """
-        include = {
-            "enable_fusion", "enable_noop", "enable_sequence_parallelism",
-            "enable_async_tp"
-        }
-        dict_ = {k: v for k, v in asdict(self).items() if k in include}
+        exclude = {"dump_graph_stages", "dump_graph_dir"}
+        dict_ = {k: v for k, v in asdict(self).items() if k not in exclude}
         return InductorPass.hash_dict(dict_)
 
     def __post_init__(self) -> None:
-        if not self.enable_noop and self.enable_fusion:
-            logger.warning_once(
-                "Fusion enabled but reshape elimination disabled. "
-                "RMSNorm + quant (fp8) fusion might not work")
+        if not self.enable_noop:
+            if self.enable_fusion:
+                logger.warning_once(
+                    "Fusion enabled but reshape elimination disabled. "
+                    "RMSNorm/SiluMul + quant (fp8) fusion might not work")
+            if self.enable_attn_fusion:
+                logger.warning_once(
+                    "Fusion enabled but reshape elimination disabled. "
+                    "Attention + quant (fp8) fusion might not work")
 
 
 @config
@@ -3798,7 +3994,8 @@ class CompilationConfig:
     - 'none,+op1,+op2' to enable only op1 and op2
 
     By default, all custom ops are enabled when running without Inductor and
-    disabled when running with Inductor (compile_level >= Inductor)."""
+    disabled when running with Inductor: level>=PIECEWISE and use_inductor=True.
+    Inductor generates (fused) Triton kernels for disabled custom ops."""
     splitting_ops: list[str] = field(default_factory=list)
     """A list of ops to split the full graph into subgraphs, used in piecewise
     compilation."""
@@ -3807,10 +4004,13 @@ class CompilationConfig:
     use_inductor: bool = True
     """Whether to use inductor compilation:
 
-    - False: inductor compilation is not used. graph runs in eager.
-    - True: inductor compilation is used. one graph for symbolic shape
-        is compiled. In addition, compile for compile_sizes,
-        using configurations in inductor_compile_config."""
+    - False: inductor compilation is not used. graph runs in eager
+        (custom_ops enabled by default).
+    - True: inductor compilation is used (custom_ops disabled by default).
+        One graph for symbolic shape and one graph per size in compile_sizes
+        are compiled using configurations in inductor_compile_config.
+        
+    This setting is ignored if level<PIECEWISE."""
     compile_sizes: Optional[list[Union[int, str]]] = None
     """Sizes to compile for inductor. In addition
     to integers, it also supports "cudagraph_capture_sizes" to
@@ -3826,12 +4026,14 @@ class CompilationConfig:
     constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`."""
 
     # CudaGraph compilation
-    use_cudagraph: bool = False
+    use_cudagraph: bool = field(default_factory=lambda: envs.VLLM_USE_V1)
     """Whether to use cudagraph inside compilation.
     - False: cudagraph inside compilation is not used.
     - True: cudagraph inside compilation is used. It requires
         that all input buffers have fixed addresses, and all
         splitting ops write their outputs to input buffers.
+    In the vLLM V1 Engine, this flag only applies for
+    CompilationLevel.PIECEWISE (aka -O3).
     Note that this is orthogonal to the cudagraph capture logic
     outside of compilation.
     TODO: move outside cudagraph logic into compilation.
@@ -3915,19 +4117,24 @@ class CompilationConfig:
 
     def __repr__(self) -> str:
         exclude = {
-            "static_forward_context",
-            "enabled_custom_ops",
-            "disabled_custom_ops",
-            "compilation_time",
-            "bs_to_padded_graph_size",
-            "pass_config",
-            "traced_files",
+            "static_forward_context": True,
+            "enabled_custom_ops": True,
+            "disabled_custom_ops": True,
+            "compilation_time": True,
+            "bs_to_padded_graph_size": True,
+            "pass_config": True,
+            "traced_files": True,
+            "inductor_compile_config": {
+                "post_grad_custom_post_pass": True,
+            },
         }
         # The cast to string is necessary because Pydantic is mocked in docs
         # builds and sphinx-argparse doesn't know the return type of decode()
         return str(
             TypeAdapter(CompilationConfig).dump_json(
-                self, exclude=exclude, exclude_unset=True).decode())
+                self,
+                exclude=exclude,  # type: ignore[arg-type]
+                exclude_unset=True).decode())
 
     __str__ = __repr__
 
@@ -4284,6 +4491,9 @@ class VllmConfig:
     def __post_init__(self):
         """Verify configs are valid & consistent with each other.
         """
+
+        self.try_verify_and_update_config()
+
         if self.model_config is not None:
             self.model_config.verify_async_output_proc(self.parallel_config,
                                                        self.speculative_config,
@@ -4325,13 +4535,9 @@ class VllmConfig:
             self.compilation_config.custom_ops.append("+rms_norm")
         if envs.VLLM_USE_V1 and self.model_config is not None and \
             not self.model_config.enforce_eager:
-            # FIXME(rob): Add function to set all of these.
-            if not self.compilation_config.custom_ops:
-                self.compilation_config.custom_ops = ["none"]
-            self.compilation_config.use_cudagraph = True
+            # By default, V1 uses piecewise CUDA graphs. If full_cuda_graph
+            # is set to True, full CUDA graphs will be used.
             self.compilation_config.cudagraph_num_of_warmups = 1
-            self.compilation_config.pass_config.enable_fusion = False
-            self.compilation_config.pass_config.enable_noop = False
             self.compilation_config.level = CompilationLevel.PIECEWISE
             self.compilation_config.set_splitting_ops_for_v1()
 
@@ -4355,11 +4561,30 @@ class VllmConfig:
 
         if self.compilation_config.full_cuda_graph and \
             not self.model_config.disable_cascade_attn:
-            logger.warning_once(
-                "full_cuda_graph is not supported with "
-                "cascade attention. Disabling cascade attention.")
+            logger.info("full_cuda_graph is not supported with "
+                        "cascade attention. Disabling cascade attention.")
             self.model_config.disable_cascade_attn = True
-            self.cache_config.enable_prefix_caching = False
+
+        disable_chunked_prefill_reasons: list[str] = []
+
+        if self.model_config and self.model_config.pooler_config:
+            pooling_type = self.model_config.pooler_config.pooling_type
+            if pooling_type is None or pooling_type.lower() != "last":
+                disable_chunked_prefill_reasons.append(
+                    "Only \"last\" pooling supports chunked "
+                    "prefill and prefix caching; disabling both.")
+
+        if disable_chunked_prefill_reasons:
+            for reason in disable_chunked_prefill_reasons:
+                logger.info(reason)
+            self.scheduler_config.chunked_prefill_enabled = False
+            self.scheduler_config.long_prefill_token_threshold = 0
+            self.scheduler_config.max_num_batched_tokens = max(
+                self.scheduler_config.max_model_len,
+                DEFAULT_MAX_NUM_BATCHED_TOKENS)
+
+            if self.cache_config is not None:
+                self.cache_config.enable_prefix_caching = False
 
         if (self.kv_events_config is not None
                 and self.kv_events_config.enable_kv_cache_events
@@ -4378,6 +4603,21 @@ class VllmConfig:
 
         if not self.instance_id:
             self.instance_id = random_uuid()[:5]
+
+        if (envs.VLLM_USE_V1
+                and not self.scheduler_config.disable_hybrid_kv_cache_manager):
+            # logger should only print warning message for hybrid models. As we
+            # can't know whether the model is hybrid or not now, so we don't log
+            # warning message here and will log it later.
+            if not (current_platform.is_cuda() or current_platform.is_rocm()):
+                # Hybrid KV cache manager is not supported on non-GPU platforms.
+                self.scheduler_config.disable_hybrid_kv_cache_manager = True
+            if self.kv_transfer_config is not None:
+                # Hybrid KV cache manager is not compatible with KV transfer.
+                self.scheduler_config.disable_hybrid_kv_cache_manager = True
+            if self.kv_events_config is not None:
+                # Hybrid KV cache manager is not compatible with KV events.
+                self.scheduler_config.disable_hybrid_kv_cache_manager = True
 
     def update_sizes_for_sequence_parallelism(self,
                                               possible_sizes: list) -> list:
@@ -4485,11 +4725,21 @@ class VllmConfig:
             batch_size_capture_list)
 
     def recalculate_max_model_len(self, max_model_len: int):
+        # Can only be called in try_verify_and_update_config
         model_config = self.model_config
         max_model_len = model_config.get_and_verify_max_len(max_model_len)
         self.model_config.max_model_len = max_model_len
         self.scheduler_config.max_model_len = max_model_len
-        self.compute_hash()
+
+    def try_verify_and_update_config(self):
+        architecture = getattr(self.model_config, "architecture", None)
+        if architecture is None:
+            return
+
+        from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+        cls = MODELS_CONFIG_MAP.get(architecture, None)
+        if cls is not None:
+            cls.verify_and_update_config(self)
 
     def __str__(self):
         return (
@@ -4527,10 +4777,13 @@ class VllmConfig:
 
 
 _current_vllm_config: Optional[VllmConfig] = None
+_current_prefix: Optional[str] = None
 
 
 @contextmanager
-def set_current_vllm_config(vllm_config: VllmConfig, check_compile=False):
+def set_current_vllm_config(vllm_config: VllmConfig,
+                            check_compile=False,
+                            prefix: Optional[str] = None):
     """
     Temporarily set the current vLLM config.
     Used during model initialization.
@@ -4538,12 +4791,14 @@ def set_current_vllm_config(vllm_config: VllmConfig, check_compile=False):
     so that all modules can access it, e.g. custom ops
     can access the vLLM config to determine how to dispatch.
     """
-    global _current_vllm_config
+    global _current_vllm_config, _current_prefix
     old_vllm_config = _current_vllm_config
+    old_prefix = _current_prefix
     from vllm.compilation.counter import compilation_counter
     num_models_seen = compilation_counter.num_models_seen
     try:
         _current_vllm_config = vllm_config
+        _current_prefix = prefix
         yield
     except Exception:
         raise
@@ -4567,6 +4822,7 @@ def set_current_vllm_config(vllm_config: VllmConfig, check_compile=False):
                 vllm_config.model_config.model)
     finally:
         _current_vllm_config = old_vllm_config
+        _current_prefix = old_prefix
 
 
 def get_current_vllm_config() -> VllmConfig:
@@ -4578,6 +4834,15 @@ def get_current_vllm_config() -> VllmConfig:
         from vllm.config import VllmConfig
         return VllmConfig()
     return _current_vllm_config
+
+
+def get_current_model_prefix() -> str:
+    """
+    Get the prefix of the model that's currently being initialized.
+    """
+    assert _current_prefix is not None, \
+        "Current model prefix is not set. "
+    return _current_prefix
 
 
 def contains_object_print(text):
